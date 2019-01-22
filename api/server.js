@@ -3,20 +3,48 @@ const express = require('express');
 const helmet = require('helmet')
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
+const session = require('express-session');
+const KnexSessionStore = require('connect-session-knex')(session);
 const db = require('../database/helpers/dbHelpers.js');
+const dbKnex = require('../database/dbConfig.js');
 
 
 const server = express();
 
+const sessionConfig = {
+  name: 'TutorialDemo', // default is sid
+  secret: 'asdfasdasa', // used for cookie
+  cookie: {
+    // maxAge: 1000 * 60 * 10, // session will be good for 10 minutes (milliseconds)
+    // maxAge: 1000 * 15, // session will be good for 15 seconds (milliseconds)
+    // maxAge: 1000 * 60 * 5, // session will be good for 5 minutes (milliseconds)
+    maxAge: 1000 * 60, // session will be good for 1 minute (milliseconds)
+    secure: false // Only send the cookie over https, Set to true in production 
+  },
+  httpOnly: true, // js can't touch this cookie
+  // read about these two options: set correctly to avoid trouble
+  // https://www.npmjs.com/package/express-session
+  resave: false,
+  saveUninitialized: false,
+  store: new KnexSessionStore({ // used to save session if server restarts
+    tablename: 'sessions',
+    sidfieldname: 'sid', // data inside of your database
+    knex: dbKnex, // asks knex if we already have this file
+    createtable: true, // creates this table if it does not exist
+    clearInterval: 1000 * 60 * 60 // clears sessions every hour from the db
+  })
+}
+
 server.use(helmet());
 server.use(express.json());
 server.use(cors());
+server.use(session(sessionConfig)); // pass an object as the arg
 
 server.get('/', (req, res) => {
   res.send('sanity check');
 });
 
-server.post('/api/register', (req, res) => {
+server.post('/register', (req, res) => {
   const userInfo = req.body;
 
   // Hash the password
@@ -32,7 +60,26 @@ server.post('/api/register', (req, res) => {
     })
 })
 
-server.post('/api/login', (req, res) => {
+function protected(req, res, next) {
+  // if a session exists AND the user is logged in... next
+  // else bounce the user
+  if (req.session && req.session.userId) {
+    next()
+  } else {
+    res.status(401).json({ message: 'you shall not pass, not authenticated' })
+  }
+}
+
+// protect this endpoint so only logged in users can see it
+server.get('/users', protected, (req, res) => {
+  db.getAllUsers()
+    .then(Users => {
+      res.status(200).json(Users)
+    })
+    .catch(err => res.send(err))
+});
+
+server.post('/login', (req, res) => {
   // Precondition - Username must be unique
   // check that username exists AND that passwords match
   const creds = req.body;
@@ -48,12 +95,30 @@ server.post('/api/login', (req, res) => {
       // gets an array with a username and password...
       // and the hash matches between the db and the client
       if (user && bcrypt.compareSync(creds.password, user.password)) {
-        res.json({ welcome: user.username })
+        req.session.userId = user.id;
+        // another option...
+        // req.session.user = user;
+
+        res.json({ message: `welcome ${user.name}` })
       } else {
-        res.status(401).json({ err: "invalid username or password" })
+        res.status(401).json({ you: "shall not pass!!" })
       }
     })
     .catch(err => res.status(500).send(err));
+})
+
+server.get('/logout', (req, res) => {
+  if (req.session) {
+    req.session.destroy(err => {
+      if (err) {
+        res.status(500).send('you can never leave');
+      } else {
+        res.status(200).send('bye bye')
+      }
+    })
+  } else {
+    res.json({ message: 'logged out already' })
+  }
 })
 
 // protect this route, only authenticated users should see it
@@ -65,8 +130,6 @@ server.get('/api/users', (req, res) => {
     })
     .catch(err => res.send(err));
 });
-
-server.listen(3300, () => console.log('\nrunning on port 3300\n'));
 
 /***************************************************************************************************
  ********************************************* export(s) *******************************************
