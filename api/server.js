@@ -1,44 +1,64 @@
-
+require('dotenv').config();
 const express = require('express');
 const helmet = require('helmet')
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
-const session = require('express-session');
-const KnexSessionStore = require('connect-session-knex')(session);
 const db = require('../database/helpers/dbHelpers.js');
-const dbKnex = require('../database/dbConfig.js');
-
+const jwt = require('jsonwebtoken');
 
 const server = express();
-
-const sessionConfig = {
-  name: 'TutorialDemo', // default is sid
-  secret: 'asdfasdasa', // used for cookie
-  cookie: {
-    // maxAge: 1000 * 60 * 10, // session will be good for 10 minutes (milliseconds)
-    // maxAge: 1000 * 15, // session will be good for 15 seconds (milliseconds)
-    // maxAge: 1000 * 60 * 5, // session will be good for 5 minutes (milliseconds)
-    maxAge: 1000 * 60, // session will be good for 1 minute (milliseconds)
-    secure: false // Only send the cookie over https, Set to true in production 
-  },
-  httpOnly: true, // js can't touch this cookie
-  // read about these two options: set correctly to avoid trouble
-  // https://www.npmjs.com/package/express-session
-  resave: false,
-  saveUninitialized: false,
-  store: new KnexSessionStore({ // used to save session if server restarts
-    tablename: 'sessions',
-    sidfieldname: 'sid', // data inside of your database
-    knex: dbKnex, // asks knex if we already have this file
-    createtable: true, // creates this table if it does not exist
-    clearInterval: 1000 * 60 * 60 // clears sessions every hour from the db
-  })
-}
 
 server.use(helmet());
 server.use(express.json());
 server.use(cors());
-server.use(session(sessionConfig)); // pass an object as the arg
+
+// **********************************************************************
+
+function generateToken(user) {
+  const payload = {
+    username: user.username,
+    name: user.name,
+    roles: ['admin', 'accountant'] // should come from the database user.roles
+  }
+
+  const secret = process.env.JWT_SECRET; // bad practice because of env, it can be hackable
+
+  const options = {
+    expiresIn: '45m' // 10 mins... otherValues('60', '2 days', '10h', '7d')
+  };
+
+  return jwt.sign(payload, secret, options);
+}
+
+function lock(req, res, next) {
+  // the auth token is normally sent in the authorization header
+  const token = req.headers.authorization;
+
+  if (token) {
+    jwt.verify(token, process.env.JWT_SECRET, (err, decodedToken) => {
+      if (err) {
+        res.status(401).json({ message: 'invalid token' });
+      } else {
+        req.decodedToken = decodedToken;
+        next();
+      }
+    })
+  } else {
+    res.status(401).json({ message: 'no token provided' });
+  }
+}
+
+function checkRole(role) {
+  return function (req, res, next) {
+    if (req.decodedToken.roles.includes(role)) {
+      next();
+    } else {
+      res.status(403).json({ message: `you need to be an ${role}` })
+    }
+  }
+}
+
+// **********************************************************************
 
 server.get('/', (req, res) => {
   res.send('sanity check');
@@ -60,19 +80,30 @@ server.post('/register', (req, res) => {
     })
 })
 
-function protected(req, res, next) {
-  // if a session exists AND the user is logged in... next
-  // else bounce the user
-  if (req.session && req.session.userId) {
-    next()
-  } else {
-    res.status(401).json({ message: 'you shall not pass, not authenticated' })
-  }
-}
+// protect this endpoint so only logged in users can see it
+server.get('/users', lock, checkRole('admin'), async (req, res) => {
+  const users = await db.getAllUsers('users')
+    .select('id', 'username', 'name');
+
+  res.status(200).json({ users, decodedToken: req.decodedToken });
+});
 
 // protect this endpoint so only logged in users can see it
-server.get('/users', protected, (req, res) => {
+server.get('/users/me', lock, checkRole('accountant'), (req, res) => {
   db.getAllUsers()
+    .where({ username: req.decodedToken.username })
+    .first()
+    .then(Users => {
+      res.status(200).json(Users)
+    })
+    .catch(err => res.send(err))
+});
+
+// protect this endpoint so only logged in users can see it
+server.get('/users/:id', lock, (req, res) => {
+  db.getAllUsers()
+    .where({ id: req.params.id })
+    .first()
     .then(Users => {
       res.status(200).json(Users)
     })
@@ -84,41 +115,21 @@ server.post('/login', (req, res) => {
   // check that username exists AND that passwords match
   const creds = req.body;
 
+
   db.findByUsername(creds.username)
     .first() // returns the first single object (containing the user found) in the array. If no objects were found, an empty array is returned.
     .then(user => {
-      /* notes...
-        console.log('body user', creds); // client password
-        console.log('body user', bcrypt.hashSync(creds.password)); // notice different hash key gets created than what is stored in the db... to check hash is same for same password... use bcrypt.compareSync(clientPassword, dbHash)
-        console.log('database user', users[0]); // database hash password
-      */
-      // gets an array with a username and password...
-      // and the hash matches between the db and the client
+      const token = generateToken(user);
       if (user && bcrypt.compareSync(creds.password, user.password)) {
-        req.session.userId = user.id;
         // another option...
         // req.session.user = user;
 
-        res.json({ message: `welcome ${user.name}` })
+        res.json({ message: `welcome ${user.name}`, token })
       } else {
         res.status(401).json({ you: "shall not pass!!" })
       }
     })
     .catch(err => res.status(500).send(err));
-})
-
-server.get('/logout', (req, res) => {
-  if (req.session) {
-    req.session.destroy(err => {
-      if (err) {
-        res.status(500).send('you can never leave');
-      } else {
-        res.status(200).send('bye bye')
-      }
-    })
-  } else {
-    res.json({ message: 'logged out already' })
-  }
 })
 
 // protect this route, only authenticated users should see it
